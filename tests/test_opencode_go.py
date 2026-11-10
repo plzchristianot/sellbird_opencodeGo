@@ -56,7 +56,18 @@ async def test_request_shape():
 @pytest.mark.parametrize("response, kind, retryable", [
     (httpx.Response(401, json={"error": {"message": "bad key"}}), "auth", False),
     (httpx.Response(403, json={"error": {"message": "no access"}}), "auth", False),
-    (httpx.Response(429, json={"error": {"message": "slow down"}}), "usage_limit", False),
+    (httpx.Response(429, json={"error": {"message": "Monthly usage limit reached"}}),
+     "usage_limit", False),
+    (httpx.Response(429, json={"error": {"message": "Too many requests, retry in 2s"}}),
+     "transient", True),
+    (httpx.Response(429, headers={"retry-after": "3600"}, json={"error": {"message": "slow down"}}),
+     "usage_limit", False),
+    (httpx.Response(403, json={"error": {"message": "Your plan's usage limit was reached"}}),
+     "usage_limit", False),
+    (httpx.Response(400, json={"error": {"message": "Prompt exceeds the model's context limit"}}),
+     "protocol", False),
+    (httpx.Response(400, json={"error": {"message": "max_tokens is too large; output limit is 8000"}}),
+     "protocol", False),
     (httpx.Response(400, json={"error": {"message": "Upstream request failed: Model is unavailable."}}),
      "setup", False),
     (httpx.Response(400, json={"error": {"message": "Monthly usage limit reached"}}),
@@ -343,3 +354,38 @@ async def test_quota_client_has_no_balance_to_read():
     quota.invalidate()
     assert await quota.get_utilization() is None
     assert await OpenCodeGoQuotaClient().get_utilization() is None
+
+
+@pytest.mark.asyncio
+async def test_env_file_wins_over_a_stale_environment_value(monkeypatch):
+    """`sellbird run` loads .env into the environment at startup; a key fixed in
+    the file afterwards must still be the one used."""
+    import sellbird.opencode_go as og
+    monkeypatch.setenv("OPENCODE_GO_API_KEY", "old-key-not-real")
+    monkeypatch.setattr(og, "dotenv_values",
+                        lambda *_a, **_k: {"OPENCODE_GO_API_KEY": " new-key-not-real "})
+    seen = {}
+
+    def handler(request):
+        seen["auth"] = request.headers["authorization"]
+        return ok()
+
+    client = og.OpenCodeGoClient("deepseek-v4.1-flash", transport=httpx.MockTransport(handler))
+    await client.run("hi", timeout=30)
+    assert seen["auth"] == "Bearer new-key-not-real"
+
+
+@pytest.mark.asyncio
+async def test_blank_env_file_line_falls_back_to_the_environment(monkeypatch):
+    import sellbird.opencode_go as og
+    monkeypatch.setenv("OPENCODE_GO_API_KEY", "env-key-not-real")
+    monkeypatch.setattr(og, "dotenv_values", lambda *_a, **_k: {"OPENCODE_GO_API_KEY": ""})
+    seen = {}
+
+    def handler(request):
+        seen["auth"] = request.headers["authorization"]
+        return ok()
+
+    client = og.OpenCodeGoClient("deepseek-v4.1-flash", transport=httpx.MockTransport(handler))
+    await client.run("hi", timeout=30)
+    assert seen["auth"] == "Bearer env-key-not-real"

@@ -222,3 +222,18 @@ async def test_another_providers_usage_limit_pause_is_not_inherited(state):
     assert brain.paused_reason == ""
     assert await brain.is_within_budget(1000, max_percent=80) is True
     assert await brain.think("hi") == "fine"
+
+
+@pytest.mark.asyncio
+async def test_each_call_is_its_own_row_in_the_usage_totals(state):
+    """The service wants one stable x-opencode-session, but the usage views count
+    DISTINCT session_id as calls, so every call must be recorded with its own id."""
+    from tests.fake_opencode_go import client_with, ok
+
+    brain = Brain(state, BrainConfig(provider="opencode_go"))
+    brain.opencode_go = client_with(lambda request: ok())
+    for _ in range(3):
+        assert await brain.think("hi", agent="writer", task="draft") == "ok"
+    totals = await state.usage_totals()
+    assert totals["today"]["calls"] == 3
+    assert await state.get_usage_today("opencode_go") == 3

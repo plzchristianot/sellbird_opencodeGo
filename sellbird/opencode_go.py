@@ -40,8 +40,15 @@ RETRY_MAX_TOKENS = 32000
 CATALOG_TTL = 300.0
 CATALOG_FAIL_TTL = 60.0
 
-_LIMIT_WORDS = ("limit", "quota", "allowance")
+# Plan-allowance wording. A bare "limit" is not enough: "context limit" and
+# "output limit" describe one request, not the plan, and must not stop every call.
+_PLAN_PHRASES = ("usage limit", "quota", "allowance", "limit reached", "limit exceeded",
+                 "monthly limit", "weekly limit")
+_REQUEST_WORDS = ("context", "token")
+_TOO_LARGE_WORDS = ("context", "max_tokens", "too long", "too large")
 _SETUP_WORDS = ("unavailable", "unknown model", "not found", "api key", "session")
+# A Retry-After this long means the plan is spent, not a momentary rate limit.
+_LONG_RETRY_SECONDS = 600
 
 
 class OpenCodeGoError(Exception):
@@ -62,7 +69,7 @@ class OpenCodeGoError(Exception):
 class OpenCodeGoResult:
     text: str
     model: str = ""
-    thread_id: str = ""  # the x-opencode-session used, like Codex's thread id
+    thread_id: str = ""  # unique per call (the session header plus a suffix)
     duration_ms: int = 0
     usage: dict = field(default_factory=dict)
     rate_limits: dict | None = None
@@ -104,13 +111,15 @@ class OpenCodeGoClient:
 
     def _key(self) -> str:
         """The API key, trimmed; blank counts as missing. Order: the value
-        given at construction, the environment, then the project's .env."""
-        raw = self._api_key
-        if raw is None:
-            raw = os.environ.get(API_KEY_ENV)
-        if raw is None:
-            raw = dotenv_values(PROJECT_ROOT / ".env").get(API_KEY_ENV)
-        return (raw or "").strip()
+        given at construction, then the project's .env, then the environment.
+        The file comes before the environment because ``sellbird run`` loads
+        .env into the environment once at startup: a key fixed in the file
+        afterwards must win over that stale copy. A blank line in .env (as in
+        .env.example) falls through to the environment."""
+        if self._api_key is not None:
+            return self._api_key.strip()
+        from_file = (dotenv_values(PROJECT_ROOT / ".env").get(API_KEY_ENV) or "").strip()
+        return from_file or (os.environ.get(API_KEY_ENV) or "").strip()
 
     def _require_key(self) -> str:
         key = self._key()
@@ -250,36 +259,58 @@ class OpenCodeGoClient:
         return OpenCodeGoResult(
             text=text,
             model=str(data.get("model") or self.model),
-            thread_id=self._session,
+            # Usage views count DISTINCT session_id as calls, so each call gets
+            # its own id even though the x-opencode-session header is stable.
+            thread_id=f"{self._session}:{uuid.uuid4().hex[:8]}",
             duration_ms=int((time.monotonic() - started) * 1000),
             usage=_parse_usage(data),
         )
 
 
 def raise_for_status(response: httpx.Response) -> None:
-    """Map an HTTP failure to an OpenCodeGoError. Only the status and a few
-    keywords from the body are used; the body itself is never repeated."""
+    """Map an HTTP failure to an OpenCodeGoError. Only the status, one header
+    and a few keywords from the body are used; the body is never repeated."""
     status = response.status_code
     if status < 300:
         return
     if status < 400:
         raise OpenCodeGoError(
             f"OpenCode Go answered with an unexpected redirect ({status}).", "protocol")
+    if status >= 500:
+        raise OpenCodeGoError(f"OpenCode Go server error ({status}).", "transient", True)
+    text = response.text.lower()
+    plan_spent = (any(p in text for p in _PLAN_PHRASES)
+                  and not any(w in text for w in _REQUEST_WORDS))
+    if plan_spent:
+        raise OpenCodeGoError(
+            "OpenCode Go usage limit reached for this plan.", "usage_limit")
     if status in (401, 403):
         raise OpenCodeGoError(
             "OpenCode Go rejected the API key. Check OPENCODE_GO_API_KEY and that your "
             "Go subscription is active.", "auth")
-    if status >= 500:
-        raise OpenCodeGoError(f"OpenCode Go server error ({status}).", "transient", True)
-    text = response.text.lower()
-    if status == 429 or any(word in text for word in _LIMIT_WORDS):
+    if status == 429:
+        if _retry_after_seconds(response) >= _LONG_RETRY_SECONDS:
+            raise OpenCodeGoError(
+                "OpenCode Go usage limit reached for this plan.", "usage_limit")
         raise OpenCodeGoError(
-            "OpenCode Go usage limit reached for this plan.", "usage_limit")
+            "OpenCode Go is rate limiting requests; trying again shortly.", "transient", True)
+    if any(word in text for word in _TOO_LARGE_WORDS):
+        raise OpenCodeGoError(
+            "OpenCode Go refused the request as too large for this model "
+            "(prompt or max_tokens). Nothing is paused.", "protocol")
     if any(word in text for word in _SETUP_WORDS):
         raise OpenCodeGoError(
             "OpenCode Go can't use this model or request (model unavailable or "
             "not allowed). Check brain.model.", "setup")
     raise OpenCodeGoError(f"OpenCode Go rejected the request ({status}).", "protocol")
+
+
+def _retry_after_seconds(response: httpx.Response) -> float:
+    """The Retry-After header in seconds; 0 when absent or not a number."""
+    try:
+        return float(response.headers.get("retry-after", "0"))
+    except ValueError:
+        return 0.0
 
 
 def _choice(data: dict) -> dict:

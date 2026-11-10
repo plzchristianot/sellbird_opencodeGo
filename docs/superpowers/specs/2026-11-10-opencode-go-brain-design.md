@@ -85,9 +85,14 @@ hard-coded.
     `length`, which is retried once with a larger `max_tokens` before failing
     as `transient`; only `content` is returned (never `reasoning_content`);
     the key never appears in logs or error text (`logsafety.redact`).
-  - Error mapping: 401/403 → `auth`; 400 unavailable-model or missing-key →
-    `setup`; 429 or a body mentioning a usage/limit/quota condition →
-    `usage_limit`; 5xx, timeouts, connection errors → `transient`.
+  - Error mapping (revised after the final review: a bare "limit" or any 429
+    is not proof the plan is spent): a 4xx body with plan wording ("usage
+    limit", "quota", "allowance", "limit reached/exceeded") and no
+    context/token wording → `usage_limit`; otherwise 401/403 → `auth`; 429
+    with a `Retry-After` of 10 minutes or more → `usage_limit`, any other 429
+    → `transient` (retried); 400 about context or `max_tokens` → `protocol`
+    (no pause); 400 unavailable-model or missing-key → `setup`; 5xx,
+    timeouts, connection errors → `transient`.
   - Session id: a per-process random id combined with the call's agent
     label, so one conversation stream keeps one id.
 - `OpenCodeGoQuotaClient`: `get_utilization()` returns `None` in v1 (no
