@@ -42,3 +42,24 @@ def client_with(handler, **kw):
     return OpenCodeGoClient(kw.pop("model", "deepseek-v4.1-flash"),
                             kw.pop("reasoning_effort", ""),
                             transport=httpx.MockTransport(handler), **kw)
+
+
+def catalog(models: dict[str, dict]) -> dict:
+    """A /models reply. ``models`` maps id -> {"protocol", "efforts", "output_limit"}."""
+    data = []
+    for model_id, spec in models.items():
+        entry = {"id": model_id, "object": "model", "type": "chat",
+                 "api": {spec.get("protocol", "chat-completions"):
+                         {"base_url": "https://opencode.ai/inference/go/openai/v1"}},
+                 "capabilities": {"reasoning": {"supported": True,
+                                                "effort": spec.get("efforts", [])}},
+                 "limit": {"context": 1000000, "output": spec.get("output_limit", 384000)}}
+        data.append(entry)
+    return {"object": "list", "data": data}
+
+
+DEFAULT_CATALOG = {
+    "deepseek-v4.1-flash": {"efforts": ["low", "high", "max"]},
+    "deepseek-v4-pro": {"efforts": ["high", "max"]},
+    "grok-4.7": {"protocol": "responses", "efforts": ["low", "high"]},
+}

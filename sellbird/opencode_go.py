@@ -37,6 +37,8 @@ API_KEY_ENV = "OPENCODE_GO_API_KEY"
 # Reasoning tokens count against max_tokens, so leave room for them.
 MAX_TOKENS = 16000
 RETRY_MAX_TOKENS = 32000
+CATALOG_TTL = 300.0
+CATALOG_FAIL_TTL = 60.0
 
 _LIMIT_WORDS = ("limit", "quota", "allowance")
 _SETUP_WORDS = ("unavailable", "unknown model", "not found", "api key", "session")
@@ -91,6 +93,12 @@ class OpenCodeGoClient:
         self._api_key = api_key
         self._transport = transport
         self._session = "sellbird-" + uuid.uuid4().hex[:16]
+        # The model list (or why it couldn't be read), cached briefly and only
+        # for the key it was read with.
+        self._catalog: dict | None = None
+        self._catalog_error: OpenCodeGoError | None = None
+        self._catalog_at = 0.0
+        self._catalog_digest = ""
 
     # ── credentials ──
 
@@ -153,6 +161,65 @@ class OpenCodeGoClient:
                 "OpenCode Go returned an unexpected reply.", "transient", True)
         return data
 
+    # ── the model catalog ──
+
+    def _key_digest(self) -> str:
+        key = self._key()
+        return sha256(key.encode()).hexdigest()[:12] if key else ""
+
+    async def list_models(self) -> dict[str, dict]:
+        """id -> {"protocol", "efforts", "output_limit"} from the live catalog.
+
+        Cached for CATALOG_TTL (CATALOG_FAIL_TTL for a failure, so a broken
+        service isn't asked every heartbeat), and only for the key it was read
+        with, so a new key is tried at once."""
+        key = self._require_key()
+        digest = self._key_digest()
+        if digest != self._catalog_digest:
+            self._catalog = self._catalog_error = None
+            self._catalog_digest = digest
+        age = time.monotonic() - self._catalog_at
+        if self._catalog is not None and age < CATALOG_TTL:
+            return self._catalog
+        if self._catalog_error is not None and age < CATALOG_FAIL_TTL:
+            raise self._catalog_error
+        try:
+            models = _parse_catalog(await self._request("GET", MODELS_URL, key, 30.0))
+        except OpenCodeGoError as e:
+            self._catalog, self._catalog_error = None, e
+            self._catalog_at = time.monotonic()
+            raise
+        self._catalog, self._catalog_error = models, None
+        self._catalog_at = time.monotonic()
+        return models
+
+    async def preflight(self) -> None:
+        """Can a call be made right now? Reads the model list with the key and
+        checks the configured model and effort against it. Sends no prompt and
+        spends no allowance."""
+        models = await self.list_models()
+        usable = ", ".join(supported_models(models)) or "none listed"
+        entry = models.get(self.model)
+        if entry is None:
+            raise OpenCodeGoError(
+                f"Model '{self.model}' is not in your OpenCode Go catalog. "
+                f"Models Sellbird can use: {usable}.", "setup")
+        if entry["protocol"] != "chat-completions":
+            raise OpenCodeGoError(
+                f"Model '{self.model}' uses the '{entry['protocol'] or 'unknown'}' protocol; "
+                f"Sellbird supports chat-completions models only: {usable}.", "setup")
+        if self.reasoning_effort and self.reasoning_effort not in entry["efforts"]:
+            raise OpenCodeGoError(
+                f"Model '{self.model}' doesn't offer reasoning_effort "
+                f"'{self.reasoning_effort}'. Valid: "
+                f"{', '.join(entry['efforts']) or 'none (leave it blank)'}.", "setup")
+
+    def _cap(self, tokens: int) -> int:
+        """Never ask for more output than the model's catalog entry allows."""
+        entry = (self._catalog or {}).get(self.model) or {}
+        limit = entry.get("output_limit")
+        return min(tokens, limit) if limit else tokens
+
     # ── a call ──
 
     async def run(self, prompt: str, timeout: float, skip_if=None) -> OpenCodeGoResult:
@@ -167,7 +234,7 @@ class OpenCodeGoClient:
             body = {
                 "model": self.model,
                 "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": max_tokens,
+                "max_tokens": self._cap(max_tokens),
             }
             if self.reasoning_effort:
                 body["reasoning_effort"] = self.reasoning_effort
@@ -261,3 +328,49 @@ def _parse_usage(data: dict) -> dict:
         + _int(tokens.get("cache_write_1h")),
         "cost_usd": float(allowance) if isinstance(allowance, (int, float)) else 0.0,
     }
+
+
+def _parse_catalog(data: dict) -> dict[str, dict]:
+    """Read the /models reply defensively: entries missing pieces are kept as
+    unusable (empty protocol), never a KeyError."""
+    entries = data.get("data")
+    if not isinstance(entries, list):
+        raise OpenCodeGoError("OpenCode Go model list was unreadable.", "transient", True)
+    models: dict[str, dict] = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
+            continue
+        api = entry.get("api")
+        protocol = next(iter(api), "") if isinstance(api, dict) and api else ""
+        caps = entry.get("capabilities")
+        reasoning = caps.get("reasoning") if isinstance(caps, dict) else None
+        efforts = reasoning.get("effort") if isinstance(reasoning, dict) else None
+        limit = entry.get("limit")
+        output = limit.get("output") if isinstance(limit, dict) else None
+        models[entry["id"]] = {
+            "protocol": protocol if isinstance(protocol, str) else "",
+            "efforts": [e for e in efforts if isinstance(e, str)]
+            if isinstance(efforts, list) else [],
+            "output_limit": output if isinstance(output, int) and output > 0 else None,
+        }
+    return models
+
+
+def supported_models(catalog: dict[str, dict]) -> list[str]:
+    """Ids Sellbird can call in v1: those on the chat-completions protocol."""
+    return sorted(k for k, v in catalog.items() if v.get("protocol") == "chat-completions")
+
+
+class OpenCodeGoQuotaClient:
+    """Same interface as the Claude and Codex quota gauges. OpenCode Go has no
+    documented balance endpoint, so there is nothing to read: the budget gate
+    falls back to Sellbird's own call counter and the dashboard says so."""
+
+    def __init__(self, client: OpenCodeGoClient | None = None):
+        self.client = client
+
+    def invalidate(self) -> None:
+        """Nothing cached to forget."""
+
+    async def get_utilization(self) -> None:
+        return None

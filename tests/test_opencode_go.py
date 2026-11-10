@@ -211,3 +211,135 @@ async def test_cancellation_propagates():
 
     with pytest.raises(asyncio.CancelledError):
         await client_with(handler).run("hi", timeout=30)
+
+
+# ── catalog, preflight, quota ──
+
+from sellbird.opencode_go import MODELS_URL, OpenCodeGoQuotaClient, supported_models  # noqa: E402
+from tests.fake_opencode_go import DEFAULT_CATALOG, catalog  # noqa: E402
+
+
+def _catalog_handler(payload=None, seen=None):
+    def handler(request):
+        if seen is not None:
+            seen.append(request)
+        return httpx.Response(200, json=payload if payload is not None else catalog(DEFAULT_CATALOG))
+    return handler
+
+
+@pytest.mark.asyncio
+async def test_preflight_success_sends_no_prompt():
+    seen = []
+    await client_with(_catalog_handler(seen=seen)).preflight()
+    assert [(r.method, str(r.url)) for r in seen] == [("GET", MODELS_URL)]
+    assert seen[0].headers["authorization"] == f"Bearer {TEST_KEY}"
+    assert seen[0].headers["user-agent"].startswith("sellbird/")
+
+
+@pytest.mark.asyncio
+async def test_preflight_missing_key_makes_no_request():
+    seen = []
+    with pytest.raises(OpenCodeGoError) as caught:
+        await client_with(_catalog_handler(seen=seen), api_key="").preflight()
+    assert caught.value.kind == "setup"
+    assert seen == []
+
+
+@pytest.mark.asyncio
+async def test_preflight_bad_key_is_auth():
+    with pytest.raises(OpenCodeGoError) as caught:
+        await client_with(lambda r: httpx.Response(401, json={})).preflight()
+    assert caught.value.kind == "auth"
+
+
+@pytest.mark.asyncio
+async def test_preflight_unknown_model_lists_supported_ids():
+    with pytest.raises(OpenCodeGoError) as caught:
+        await client_with(_catalog_handler(), model="no-such-model").preflight()
+    assert caught.value.kind == "setup"
+    assert "deepseek-v4.1-flash" in str(caught.value)
+    assert "grok-4.7" not in str(caught.value)  # not usable in v1, so not offered
+
+
+@pytest.mark.asyncio
+async def test_preflight_wrong_protocol():
+    with pytest.raises(OpenCodeGoError) as caught:
+        await client_with(_catalog_handler(), model="grok-4.7").preflight()
+    assert caught.value.kind == "setup"
+    assert "chat-completions" in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_preflight_bad_effort_names_the_valid_ones():
+    with pytest.raises(OpenCodeGoError) as caught:
+        await client_with(_catalog_handler(), reasoning_effort="xhigh").preflight()
+    assert caught.value.kind == "setup"
+    assert "low" in str(caught.value) and "max" in str(caught.value)
+    await client_with(_catalog_handler(), reasoning_effort="max").preflight()
+
+
+@pytest.mark.asyncio
+async def test_catalog_missing_fields_is_clean_error():
+    broken = {"data": [{"id": "deepseek-v4.1-flash"}, "junk", {"no_id": True},
+                       {"id": "deepseek-v4-pro", "api": None, "capabilities": []}]}
+    with pytest.raises(OpenCodeGoError) as caught:
+        await client_with(_catalog_handler(broken)).preflight()
+    assert caught.value.kind == "setup"
+    for unreadable in ({"data": "nope"}, ["not", "a", "dict"]):
+        with pytest.raises(OpenCodeGoError) as caught:
+            await client_with(_catalog_handler(unreadable)).preflight()
+        assert caught.value.kind in ("transient", "setup")
+
+
+def test_supported_models_filters_by_protocol():
+    models = {"b": {"protocol": "chat-completions"}, "a": {"protocol": "chat-completions"},
+              "c": {"protocol": "messages"}}
+    parsed = {k: {"protocol": v["protocol"], "efforts": [], "output_limit": None}
+              for k, v in models.items()}
+    assert supported_models(parsed) == ["a", "b"]
+
+
+@pytest.mark.asyncio
+async def test_catalog_is_cached_and_failures_are_remembered_briefly():
+    seen = []
+    client = client_with(_catalog_handler(seen=seen))
+    await client.list_models()
+    await client.list_models()
+    assert len(seen) == 1
+
+    failing = []
+
+    def handler(request):
+        failing.append(request)
+        return httpx.Response(503)
+
+    bad = client_with(handler)
+    for _ in range(2):
+        with pytest.raises(OpenCodeGoError):
+            await bad.list_models()
+    assert len(failing) == 1
+
+
+@pytest.mark.asyncio
+async def test_run_clamps_max_tokens_to_the_models_output_limit():
+    bodies = []
+    small = catalog({"deepseek-v4.1-flash": {"output_limit": 8000}})
+
+    def handler(request):
+        if request.method == "GET":
+            return httpx.Response(200, json=small)
+        bodies.append(json.loads(request.content))
+        return ok()
+
+    client = client_with(handler)
+    await client.list_models()
+    await client.run("hi", timeout=30)
+    assert bodies[0]["max_tokens"] == 8000
+
+
+@pytest.mark.asyncio
+async def test_quota_client_has_no_balance_to_read():
+    quota = OpenCodeGoQuotaClient(client_with(_catalog_handler()))
+    quota.invalidate()
+    assert await quota.get_utilization() is None
+    assert await OpenCodeGoQuotaClient().get_utilization() is None
