@@ -63,11 +63,11 @@ Cycle complete. Sleeping for 15 minutes.
 
 ## No model API bill
 
-Sellbird thinks through the Claude Code CLI on your Claude Pro or Max plan, or through Codex on a ChatGPT plan. There's no API key and no per-token billing, and Sellbird throttles itself to leave room for your own work.
+Sellbird thinks through the Claude Code CLI on your Claude Pro or Max plan, through Codex on a ChatGPT plan, or through an OpenCode Go plan. There's no per-token billing, and Sellbird throttles itself to leave room for your own work.
 
 | | |
 |---|---|
-| Claude Pro or Max, or a ChatGPT plan with Codex | the subscription you already have |
+| Claude Pro or Max, a ChatGPT plan with Codex, or OpenCode Go | the subscription you already have |
 | Finding businesses | **$0** on the default source, or about $0.37 per 1,000 on the cheapest paid one |
 | Reading their websites | **$0**: three HTTP requests each, no model call |
 | Writing and sending | your subscription and a mailbox (about $7 a month for Google Workspace) |
@@ -80,7 +80,7 @@ How the loop, the budget and the isolation work: [How Sellbird works](docs/how-i
 You need:
 
 - **Python 3.11 or newer.** macOS ships 3.9, so run `brew install python@3.13` first if `python3 --version` says so.
-- **Claude Pro or Max** with the CLI signed in (`claude login`), or a **ChatGPT plan with the Codex CLI** ([Codex setup](docs/codex.md)).
+- **Claude Pro or Max** with the CLI signed in (`claude login`), a **ChatGPT plan with the Codex CLI** ([Codex setup](docs/codex.md)), or an **OpenCode Go plan** ([OpenCode Go setup](docs/opencode-go.md), read its note on intended use first).
 - **A mailbox to send from**, ideally Google Workspace on a separate sending domain. [Microsoft 365](docs/microsoft365.md) and SMTP work too.
 - **Warmup on that mailbox.** We recommend [TrulyInbox](https://trulyinbox.com/?via=sellbird): it warms a new mailbox before cold email and keeps it out of spam after, and Sellbird reads its inbox rate to tell you when you're ready.
 
@@ -174,6 +174,7 @@ database, the logs and the dashboard token.
 | [Configuration and commands](docs/configuration.md) | `.env`, `sellbird.yaml` and every command |
 | [Extensions](docs/extensions.md) | Adding routes, heartbeat steps and commands from a separate package |
 | [Using a ChatGPT plan (Codex)](docs/codex.md) | Running on Codex instead of Claude |
+| [Using an OpenCode Go plan](docs/opencode-go.md) | Running on OpenCode Go (DeepSeek by default) instead of Claude |
 | [Legal and deliverability](docs/deliverability.md) | The rules you're sending under, and warmup |
 | [Microsoft 365](docs/microsoft365.md) · [Precleared](docs/precleared.md) | Provider setup guides |
 | [Docker](docs/docker.md) · [Troubleshooting](docs/troubleshooting.md) · [Roadmap](docs/roadmap.md) | Running, fixing and what's next |

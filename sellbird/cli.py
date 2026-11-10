@@ -235,6 +235,7 @@ def cmd_status(args):
         by_provider = summary.get("usage_today_by_provider", {})
         print(f"  Claude calls today:   {by_provider.get('claude', summary['usage_today'])}")
         print(f"  Codex calls today:    {by_provider.get('codex', 0)}")
+        print(f"  OpenCode Go calls today: {by_provider.get('opencode_go', 0)}")
         from sellbird.config import compliance_notice, load_config, sending_notice
         loaded = None
         try:
@@ -306,11 +307,15 @@ def cmd_status(args):
                 elif brain.provider == "codex":
                     print(f"  Brain:                {label} ready (CLI, isolation, login, "
                           "model and account checked; no prompt sent)")
+                elif brain.provider == "opencode_go":
+                    print(f"  Brain:                {label} ready (API key and model checked "
+                          "against the live catalog; no prompt sent)")
                 else:
                     print(f"  Brain:                {label} CLI isolation flags present "
                           "(login not checked: Claude is checked by its first call)")
         elif brain_status.get("status") == "paused":
-            label = {"claude": "Claude", "codex": "Codex"}.get(brain_status.get("provider"), "Brain")
+            from sellbird.brain import PROVIDER_LABELS
+            label = PROVIDER_LABELS.get(brain_status.get("provider"), "Brain")
             print(f"  Brain:                {label} PAUSED since {brain_status.get('since', '?')}")
             print(f"                        {brain_status.get('reason', '')}")
         print()
@@ -352,7 +357,8 @@ def cmd_usage(args):
         except Exception:
             pass
 
-        label = {"claude": "Claude", "codex": "Codex"}.get(provider, "Brain")
+        from sellbird.brain import PROVIDER_LABELS
+        label = PROVIDER_LABELS.get(provider, "Brain")
         print(f"\n  {label} Usage")
         print("  " + "=" * 52)
         if windows:
@@ -364,6 +370,9 @@ def cmd_usage(args):
         elif provider == "codex":
             print("  Quota gauge unavailable (check 'codex login', the Codex CLI "
                   "version, and network).")
+        elif provider == "opencode_go":
+            print("  Quota gauge unavailable (OpenCode Go has no documented balance "
+                  "endpoint; Sellbird counts its own calls).")
         elif provider == "claude":
             print("  Quota gauge unavailable (run 'claude login' or check network).")
 
@@ -1139,13 +1148,14 @@ def main():
         help="Max pages to crawl (default: 100)",
     )
     sub.add_argument(
-        "--provider", choices=["claude", "codex"], default=None,
+        "--provider", choices=["claude", "codex", "opencode_go"], default=None,
         help="Subscription to think with (default: the one in your config, else claude)",
     )
     sub.add_argument("--model", default=None, help="Model for this provider (default: provider default)")
     sub.add_argument(
         "--reasoning-effort", default=None,
-        help="Codex reasoning effort (minimal/low/medium/high/xhigh)",
+        help="Reasoning effort: Codex minimal/low/medium/high/xhigh; OpenCode Go "
+             "none/minimal/low/medium/high/xhigh/max (the model's own list applies)",
     )
     sub.set_defaults(func=cmd_train)
 

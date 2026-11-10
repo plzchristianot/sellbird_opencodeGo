@@ -630,8 +630,12 @@ class UsageConfig(BaseModel):
         return v
 
 
-BRAIN_PROVIDERS = ("claude", "codex")
+BRAIN_PROVIDERS = ("claude", "codex", "opencode_go")
 CODEX_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+# OpenCode Go models list their own accepted efforts in the catalog (checked
+# at preflight); this is the superset a config may name.
+OPENCODE_GO_REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+OPENCODE_GO_DEFAULT_MODEL = "deepseek-v4.1-flash"
 
 # Model names are passed to a CLI, so they must look like a model name and
 # never like a flag ("-x") or anything a shell would treat specially.
@@ -672,14 +676,23 @@ class BrainConfig(BaseModel):
 
     @field_validator("reasoning_effort", mode="before")
     @classmethod
-    def _valid_effort(cls, v) -> str:
-        v = str(v or "").strip().lower()
-        if v and v not in CODEX_REASONING_EFFORTS:
+    def _normalize_effort(cls, v) -> str:
+        return str(v or "").strip().lower()
+
+    @model_validator(mode="after")
+    def _provider_defaults_and_effort(self):
+        """The effort set depends on the provider, so it is checked here, once
+        both fields are known. OpenCode Go also gets its default model."""
+        allowed = (OPENCODE_GO_REASONING_EFFORTS if self.provider == "opencode_go"
+                   else CODEX_REASONING_EFFORTS)
+        if self.reasoning_effort and self.reasoning_effort not in allowed:
             raise ValueError(
-                f"'{v}' is not a valid reasoning effort. "
-                f"Use one of: {', '.join(CODEX_REASONING_EFFORTS)}."
+                f"'{self.reasoning_effort}' is not a valid reasoning effort. "
+                f"Use one of: {', '.join(allowed)}."
             )
-        return v
+        if self.provider == "opencode_go" and not self.model:
+            self.model = OPENCODE_GO_DEFAULT_MODEL
+        return self
 
 
 class WriterConfig(BaseModel):

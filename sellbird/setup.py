@@ -136,8 +136,9 @@ def _ask_brain_config() -> BrainConfig:
     _print_sellbird("I think with an AI subscription you already pay for:")
     print("    claude — your Claude plan, via Claude Code (default)")
     print("    codex  — your ChatGPT plan, via the Codex CLI")
+    print("    opencode_go — your OpenCode Go plan, via its API key (text only, no tools)")
     while True:
-        provider = _ask("Which one? (claude/codex)", default="claude").lower()
+        provider = _ask("Which one? (claude/codex/opencode_go)", default="claude").lower()
         if provider == "codex":
             from sellbird.codex import CodexError, require_supported_platform
             try:
@@ -145,15 +146,21 @@ def _ask_brain_config() -> BrainConfig:
             except CodexError as e:
                 print(f"    ({e})")
                 continue
-        if provider in ("claude", "codex"):
+        if provider in ("claude", "codex", "opencode_go"):
             break
-        print("    (type claude or codex)")
+        print("    (type claude, codex or opencode_go)")
     if provider == "codex":
         from sellbird.codex import SUGGESTED_MODEL
         print(f"    {SUGGESTED_MODEL} is the Codex model Sellbird has verified as text-only")
         print("    (no code-execution tools). Press Enter to use it, or type another.")
+    if provider == "opencode_go":
+        from sellbird.config import OPENCODE_GO_DEFAULT_MODEL
+        print(f"    {OPENCODE_GO_DEFAULT_MODEL} (DeepSeek) is the default. Press Enter to use it,")
+        print("    or type another model from your OpenCode Go catalog.")
     while True:
-        if provider == "codex":
+        if provider == "opencode_go":
+            model = _ask("Model", default=OPENCODE_GO_DEFAULT_MODEL, required=False)
+        elif provider == "codex":
             model = _ask("Model", default=SUGGESTED_MODEL, required=False)
         else:
             model = _ask("Model (leave blank for the default)", required=False)
@@ -243,6 +250,8 @@ class SetupWizard:
         self.brain_config = _ask_brain_config()
         if self.brain_config.provider == "codex":
             await self._check_codex()
+        elif self.brain_config.provider == "opencode_go":
+            await self._check_opencode_go()
         else:
             await self._check_claude()
 
@@ -271,6 +280,37 @@ class SetupWizard:
             _print_sellbird("Claude CLI is installed but headless mode isn't working.")
             _print_sellbird("Make sure you're logged in: run 'claude login'")
             print("\n         Also verify your Max subscription is active.")
+            if not _ask_yes_no("Continue anyway?", default=False):
+                raise SystemExit(1)
+        self._check_python_packages()
+
+    async def _check_opencode_go(self):
+        """OpenCode Go needs an API key, not a CLI: take it hidden, keep it in
+        .env, and check it (and the model) against the live catalog. The check
+        sends no prompt."""
+        from sellbird.opencode_go import API_KEY_ENV
+
+        _print_sellbird("OpenCode Go is designed for OpenCode and other coding agents.")
+        _print_sellbird("Sellbird's outreach work isn't that, so OpenCode could limit your")
+        _print_sellbird("plan. Sellbird identifies itself honestly (docs/opencode-go.md).")
+        key = (os.environ.get(API_KEY_ENV) or _read_env_file().get(API_KEY_ENV) or "").strip()
+        if key:
+            print("\n  OpenCode Go API key... ✓ Found (already saved)")
+        else:
+            key = _ask("OpenCode Go API key (from opencode.ai, saved to .env)",
+                       secret=True).strip()
+        self.env_vars[API_KEY_ENV] = key
+        os.environ[API_KEY_ENV] = key  # this setup run only; .env is written at the end
+
+        print("\n  Checking OpenCode Go key and model...", end=" ", flush=True)
+        state = StateManager()
+        await state.init_db()
+        problem = await Brain(state, self.brain_config).preflight()
+        if not problem:
+            print("✓ Ready")
+        else:
+            print("✗ Not ready")
+            _print_sellbird(problem)
             if not _ask_yes_no("Continue anyway?", default=False):
                 raise SystemExit(1)
         self._check_python_packages()
@@ -848,10 +888,15 @@ class SetupWizard:
 """)
 
         # Show what's configured
+        brain_checks = {
+            "codex": ("Codex CLI (ChatGPT plan)", _check_codex_cli),
+            "opencode_go": ("OpenCode Go API key",
+                            lambda: bool(self.env_vars.get("OPENCODE_GO_API_KEY"))),
+        }
+        brain_label, brain_ok = brain_checks.get(
+            self.brain_config.provider, ("Claude Code CLI", _check_claude_cli))
         checks = {
-            ("Codex CLI (ChatGPT plan)" if self.brain_config.provider == "codex"
-             else "Claude Code CLI"): (_check_codex_cli() if self.brain_config.provider == "codex"
-                                      else _check_claude_cli()),
+            brain_label: brain_ok(),
             "Instantly API": bool(self.env_vars.get("INSTANTLY_API_KEY")),
             "LinkedIn": bool(self.env_vars.get("LINKEDIN_EMAIL")),
             "Cloudflare Crawl": bool(self.env_vars.get("CLOUDFLARE_ACCOUNT_ID")),

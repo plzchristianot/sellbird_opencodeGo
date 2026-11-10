@@ -906,11 +906,12 @@ async def get_stats():
         # get_usage_today use date.today()); SQLite's date('now') is UTC and
         # can select a different day's counts on either side of UTC midnight.
         usage = await query_db(
-            "SELECT claude_calls, codex_calls FROM usage_log WHERE date = ?",
+            "SELECT claude_calls, codex_calls, opencode_go_calls FROM usage_log WHERE date = ?",
             (date.today().isoformat(),),
         )
         usage_today = (usage[0]["claude_calls"] or 0) if usage else 0
         codex_today = (usage[0]["codex_calls"] or 0) if usage else 0
+        opencode_go_today = (usage[0]["opencode_go_calls"] or 0) if usage else 0
 
         return {
             "prospects": {"total": prospect_total, "by_status": prospect_map},
@@ -920,6 +921,7 @@ async def get_stats():
             "actions_total": action_count,
             "claude_calls_today": usage_today,
             "codex_calls_today": codex_today,
+            "opencode_go_calls_today": opencode_go_today,
             "brain_provider": _active_provider(),
             "brain_status": await _brain_status(),
         }
@@ -963,6 +965,12 @@ def _active_provider() -> str:
     return brain.provider if brain else ""
 
 
+def _provider_label(provider: str) -> str:
+    """The subscription's name for the Today card ("" -> a generic name)."""
+    from sellbird.brain import PROVIDER_LABELS
+    return PROVIDER_LABELS.get(provider, "Sellbird's model")
+
+
 def _quota_client_for(provider: str, model: str = ""):
     """One cached quota reader per provider (and Codex model). Each reads
     only its own subscription, so a Claude gauge is never shown as Codex or
@@ -972,6 +980,9 @@ def _quota_client_for(provider: str, model: str = ""):
         if provider == "codex":
             from sellbird.codex import CodexClient, CodexQuotaClient
             _quota_clients[key] = CodexQuotaClient(CodexClient(model=model))
+        elif provider == "opencode_go":
+            from sellbird.opencode_go import OpenCodeGoQuotaClient
+            _quota_clients[key] = OpenCodeGoQuotaClient()
         elif provider == "claude":
             from sellbird.integrations.quota import QuotaClient
             _quota_clients[key] = QuotaClient()
@@ -2244,7 +2255,7 @@ async def get_today():
         # Ordered by how much it blocks Sellbird from doing anything at all.
         brain = await _brain_status()
         if brain.get("status") == "paused":
-            who = "Codex" if brain.get("provider") == "codex" else "Sellbird's model"
+            who = _provider_label(brain.get("provider") or "")
             items.append({
                 "key": "brain-paused", "tone": "bad",
                 "title": f"{who} is paused, so Sellbird is waiting",
