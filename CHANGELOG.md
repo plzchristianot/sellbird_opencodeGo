@@ -7,7 +7,13 @@ minor versions can still change behaviour.
 
 ## [Unreleased]
 
+### Added
+
+- **OpenCode Go as a brain provider.** `brain.provider: opencode_go` runs every model call on an OpenCode Go plan through its API, text only (no tools, no fallback to another provider), with `deepseek-v4.1-flash` as the default model and `brain.model` to change it. `OPENCODE_GO_API_KEY` goes in `.env`; `sellbird setup`, `sellbird train --provider opencode_go`, `sellbird status --check` and the dashboard support it, and Sellbird pauses whole cycles when the key, model or plan can't be used. Only models on OpenCode's `chat-completions` protocol are supported for now. OpenCode describes Go as built for coding agents, so read [docs/opencode-go.md](docs/opencode-go.md) before choosing it. Usage is counted on its own (`usage_log.opencode_go_calls`, schema version 17).
+
 ### Changed
+
+- A usage-limit pause stored for one brain provider is no longer restored for another after you switch providers.
 
 - Seeding the signal catalog writes only a signal that is missing or whose catalog text changed. The dashboard seeds on every Today load, so this was a write per signal on every page view.
 - **The opt-out line takes any wording.** `compliance.opt_out_line` no longer
