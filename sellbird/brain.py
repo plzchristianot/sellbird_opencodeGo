@@ -40,7 +40,14 @@ _NON_RETRYABLE_PATTERNS = (
 )
 
 
-PROVIDER_LABELS = {"claude": "Claude", "codex": "Codex"}
+PROVIDER_LABELS = {"claude": "Claude", "codex": "Codex", "opencode_go": "OpenCode Go"}
+
+# Providers whose calls go through an adapter (Brain._think_adapter) rather
+# than the Claude CLI. Each adapter offers fingerprint(), preflight() and run().
+ADAPTER_PROVIDERS = ("codex", "opencode_go")
+
+# Provider -> where its usage rows say the numbers came from.
+_USAGE_SOURCE = {"codex": "codex_app_server", "opencode_go": "opencode_go_http"}
 
 # Settings key holding the brain's last health transition, for `sellbird
 # status` and the dashboard: {"provider", "status": "ok"|"paused", "reason",
@@ -89,6 +96,7 @@ class Brain:
         self.provider = self.config.provider
         self.model = self.config.model
         self.codex = None
+        self.opencode_go = None
         # Whether the last think_json got no reply at all (an outage, logout,
         # rate limit or timeout), as opposed to a reply that wasn't valid
         # JSON. Callers that count model failures must not count outages.
@@ -106,6 +114,12 @@ class Brain:
                 model=self.model, reasoning_effort=self.config.reasoning_effort
             )
             self.quota = CodexQuotaClient(self.codex)
+        elif self.provider == "opencode_go":
+            from sellbird.opencode_go import OpenCodeGoClient, OpenCodeGoQuotaClient
+            self.opencode_go = OpenCodeGoClient(
+                model=self.model, reasoning_effort=self.config.reasoning_effort
+            )
+            self.quota = OpenCodeGoQuotaClient(self.opencode_go)
         else:
             # Lazy import avoids a cycle (quota -> usage -> state).
             from sellbird.integrations.quota import QuotaClient
@@ -114,6 +128,18 @@ class Brain:
     @property
     def provider_label(self) -> str:
         return PROVIDER_LABELS[self.provider]
+
+    def _adapter(self):
+        """The adapter for the configured provider (None for Claude)."""
+        return self.codex if self.provider == "codex" else self.opencode_go
+
+    def _adapter_error(self):
+        """The error class the configured adapter raises."""
+        if self.provider == "codex":
+            from sellbird.codex import CodexError
+            return CodexError
+        from sellbird.opencode_go import OpenCodeGoError
+        return OpenCodeGoError
 
     @property
     def paused_reason(self) -> str:
@@ -127,8 +153,8 @@ class Brain:
     async def preflight(self) -> str:
         """Can this Brain be used right now? Returns "" or the reason not.
 
-        Codex only (Claude keeps its existing behaviour): runs the adapter's
-        full pre-prompt check (CodexClient.preflight): CLI version, route and
+        Adapter providers only (Claude keeps its existing behaviour): runs the
+        adapter's own pre-prompt check. For Codex (CodexClient.preflight): CLI version, route and
         lockdown attested with no login in the runtime, the native login read
         only (expiry, renewal), then with the access-only copy the configured
         model against the catalog, the ChatGPT account, and a started
@@ -136,37 +162,46 @@ class Brain:
         native login. While paused, the check is repeated only when the login
         file or the Codex executable changes, or every
         PROVIDER_RECHECK_SECONDS, so a persistent problem doesn't start
-        runtimes every heartbeat.
+        runtimes every heartbeat. For OpenCode Go it reads the model list with
+        the API key and checks the configured model and effort against it.
         """
-        if self.provider != "codex":
+        if self.provider not in ADAPTER_PROVIDERS:
             return await self._claude_preflight()
-        from sellbird.codex import CodexError
+        adapter_error = self._adapter_error()
 
         await self._expire_usage_pause()
         if self.unavailable:
-            unchanged = self.codex.fingerprint() == self._unavailable_fingerprint
+            unchanged = self._adapter().fingerprint() == self._unavailable_fingerprint
             recent = time.monotonic() - self._unavailable_at < PROVIDER_RECHECK_SECONDS
             if unchanged and recent:
                 return self.unavailable
         try:
-            await self.codex.preflight()
-        except CodexError as e:
+            await self._adapter().preflight()
+        except adapter_error as e:
             if e.kind in _PERSISTENT_CODEX_KINDS:
                 await self._mark_unavailable(e)
                 return self.unavailable
             return str(e)  # transient: skip this cycle, check again next time
         except Exception as e:
-            return f"Codex preflight failed unexpectedly ({type(e).__name__})."
+            return f"{self.provider_label} preflight failed unexpectedly ({type(e).__name__})."
         if self.unavailable:
             await self._mark_available()
         elif not self._status_synced:
-            logger.info(
-                f"Codex ready: supported CLI, isolation verified, login and account "
-                f"valid, model {self.model or 'auto'} usable with no tools (no prompt sent).")
+            if self.provider == "codex":
+                logger.info(
+                    f"Codex ready: supported CLI, isolation verified, login and account "
+                    f"valid, model {self.model or 'auto'} usable with no tools (no prompt sent).")
+            else:
+                logger.info(
+                    f"OpenCode Go ready: API key accepted, model {self.model} usable "
+                    f"(text only, no prompt sent).")
             # A pause recorded before a restart must not outlive the problem.
             self._status_synced = True
             try:
-                stored = parse_brain_status(await self.state.get_setting(BRAIN_STATUS_KEY))
+                # Only this provider's own record: a pause stored for another
+                # one (say Codex, before switching) says nothing about this plan.
+                stored = active_brain_status(
+                    await self.state.get_setting(BRAIN_STATUS_KEY), self.provider)
             except Exception:
                 stored = {}
             until = stored.get("until")
@@ -195,8 +230,8 @@ class Brain:
         return ""
 
     def _fingerprint(self):
-        if self.provider == "codex":
-            return self.codex.fingerprint()
+        if self.provider in ADAPTER_PROVIDERS:
+            return self._adapter().fingerprint()
         from sellbird.claude_runtime import fingerprint
         return fingerprint()
 
@@ -263,8 +298,8 @@ class Brain:
         ``agent``/``task`` label the call in the usage_events ledger so the
         dashboard can attribute tokens and cost to specific work.
         """
-        if self.provider == "codex":
-            return await self._think_codex(
+        if self.provider in ADAPTER_PROVIDERS:
+            return await self._think_adapter(
                 prompt, session_id=session_id, timeout=timeout,
                 max_retries=max_retries, agent=agent, task=task,
             )
@@ -411,7 +446,7 @@ class Brain:
         )
         return ""
 
-    async def _think_codex(
+    async def _think_adapter(
         self,
         prompt: str,
         session_id: str | None,
@@ -420,37 +455,41 @@ class Brain:
         agent: str,
         task: str,
     ) -> str:
-        """One isolated Codex turn per attempt (see sellbird/codex.py)."""
-        from sellbird.codex import CodexError
+        """One adapter call per attempt, for Codex (sellbird/codex.py) and
+        OpenCode Go (sellbird/opencode_go.py). The adapters raise errors with
+        the same ``kind`` / ``retryable`` contract, so pausing, retrying and
+        usage accounting live here once."""
+        adapter_error = self._adapter_error()
+        label = self.provider_label
 
         paused = self.paused_reason
         if paused:
             # Known not to work until the operator acts (or the limit
             # resets): don't start a runtime per call.
-            logger.debug(f"Codex call skipped: {paused}")
+            logger.debug(f"{label} call skipped: {paused}")
             return ""
-        logger.debug(f"Brain call via Codex (label={session_id})")
+        logger.debug(f"Brain call via {label} (label={session_id})")
         last_error = ""
         for attempt in range(max_retries + 1):
             if attempt > 0:
                 delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
                 logger.info(
-                    f"Retrying Codex call in {delay:.0f}s "
+                    f"Retrying {label} call in {delay:.0f}s "
                     f"(attempt {attempt + 1}/{max_retries + 1})..."
                 )
                 await asyncio.sleep(delay)
             try:
-                result = await self.codex.run(
+                result = await self._adapter().run(
                     prompt, timeout=timeout, skip_if=lambda: self.paused_reason)
-            except CodexError as e:
+            except adapter_error as e:
                 if e.kind == "paused":
-                    logger.debug(f"Codex call skipped: {e}")
+                    logger.debug(f"{label} call skipped: {e}")
                     return ""
                 last_error = str(e)
                 if e.retryable:
-                    logger.warning(f"Codex call failed: {e}")
+                    logger.warning(f"{label} call failed: {e}")
                     continue
-                logger.error(f"Codex call failed: {e}")
+                logger.error(f"{label} call failed: {e}")
                 if e.kind in _PERSISTENT_CODEX_KINDS:
                     await self._mark_unavailable(e)
                 elif e.kind == "usage_limit":
@@ -460,32 +499,34 @@ class Brain:
                         invalidate()
                 return ""
             except Exception as e:
-                # Not expected (the adapter reports failures as CodexError);
-                # log only the type, since messages could carry call details.
-                # CancelledError is not an Exception, so shutdown propagates.
-                logger.error(f"Codex call failed unexpectedly ({type(e).__name__}).")
+                # Not expected (the adapters report failures as their own
+                # error type); log only the type, since messages could carry
+                # call details. CancelledError is not an Exception, so
+                # shutdown propagates.
+                logger.error(f"{label} call failed unexpectedly ({type(e).__name__}).")
                 return ""
 
             try:
-                await self.state.increment_usage(provider="codex")
+                await self.state.increment_usage(provider=self.provider)
             except Exception as e:
                 logger.warning(f"Failed to record usage counter: {e}")
             try:
-                await self._record_codex_usage(result, agent=agent, task=task,
-                                               label=session_id or "")
+                await self._record_adapter_usage(result, agent=agent, task=task,
+                                                 label=session_id or "")
             except Exception as e:
                 logger.warning(f"Failed to record usage event: {e}")
             return result.text
 
         logger.error(
-            f"Codex call failed after {max_retries + 1} attempts. "
+            f"{label} call failed after {max_retries + 1} attempts. "
             f"Last error: {last_error[:200]}"
         )
         return ""
 
-    async def _record_codex_usage(self, result, agent: str, task: str, label: str):
-        """One usage row per Codex call. ChatGPT plans aren't billed per
-        token, so cost is recorded as 0 rather than estimated."""
+    async def _record_adapter_usage(self, result, agent: str, task: str, label: str):
+        """One usage row per adapter call. These plans aren't billed per
+        token: Codex records cost 0; OpenCode Go records the plan allowance
+        the call counted (``cost_usd`` in the result's usage)."""
         if not agent and label.startswith("sellbird-"):
             agent = label[len("sellbird-"):].split("-")[0]
         await self.state.record_usage_event(
@@ -495,8 +536,8 @@ class Brain:
             model=result.model,
             duration_ms=result.duration_ms,
             num_turns=1,
-            source="codex_app_server",
-            provider="codex",
+            source=_USAGE_SOURCE[self.provider],
+            provider=self.provider,
             **result.usage,
         )
 
