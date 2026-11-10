@@ -1477,17 +1477,24 @@ async function loadLogs() {
 function brainCallChips(data) {
   const chip = (label, n) => '<span class="chip">' + label + ' calls today <b>' + escHtml(String(n || 0)) + '</b></span>';
   const codex = data.codex_calls_today || 0;
+  const opencodeGo = data.opencode_go_calls_today || 0;
+  const labels = {codex: 'Codex', opencode_go: 'OpenCode Go'};
   const st = data.brain_status || {};
   // A paused brain must not look healthy: say so, and why.
   const paused = st.status === 'paused'
     ? '<span class="chip" title="' + escHtml(st.reason || '') + '">' +
-      escHtml(st.provider === 'codex' ? 'Codex' : 'Brain') + ' <b>paused</b>: ' +
+      escHtml(labels[st.provider] || 'Brain') + ' <b>paused</b>: ' +
       escHtml((st.reason || '').slice(0, 120)) + '</span>'
     : '';
-  if (data.brain_provider === 'codex') {
-    return paused + chip('Codex', codex) + (data.claude_calls_today ? chip('Claude', data.claude_calls_today) : '');
+  // The active provider first, then any other that has made calls today.
+  const counts = {claude: data.claude_calls_today || 0, codex: codex, opencode_go: opencodeGo};
+  const names = {claude: 'Claude', codex: 'Codex', opencode_go: 'OpenCode Go'};
+  const active = counts.hasOwnProperty(data.brain_provider) ? data.brain_provider : 'claude';
+  let chips = chip(names[active], counts[active]);
+  for (const key of Object.keys(counts)) {
+    if (key !== active && counts[key]) chips += chip(names[key], counts[key]);
   }
-  return paused + chip('Claude', data.claude_calls_today) + (codex ? chip('Codex', codex) : '');
+  return paused + chips;
 }
 
 function fmtTokens(n) {
@@ -1515,12 +1522,16 @@ function emailTag(p) {
 function quotaCardHtml(data) {
   const provider = data && data.quota_provider;
   if (!provider) return '';
-  const title = provider === 'codex' ? 'Codex (ChatGPT plan) Quota' : 'Claude Subscription Quota';
+  const titles = {codex: 'Codex (ChatGPT plan) Quota', opencode_go: 'OpenCode Go Quota'};
+  const title = titles[provider] || 'Claude Subscription Quota';
   let html = '<h2>' + escHtml(title) + '</h2>';
   if (!data.quota || !Object.keys(data.quota).length) {
-    const why = provider === 'codex'
-      ? "Quota unavailable: Sellbird couldn't read your ChatGPT plan's limits (check codex login, the Codex CLI version, and network)."
-      : "Quota unavailable: Sellbird couldn't read your Claude subscription's limits (check claude login and network).";
+    const whys = {
+      codex: "Quota unavailable: Sellbird couldn't read your ChatGPT plan's limits (check codex login, the Codex CLI version, and network).",
+      opencode_go: "Quota unavailable: OpenCode Go has no documented balance endpoint, so Sellbird can't read your plan's remaining allowance (see the console at opencode.ai).",
+    };
+    const why = whys[provider] ||
+      "Quota unavailable: Sellbird couldn't read your Claude subscription's limits (check claude login and network).";
     return html + '<p class="muted">' + escHtml(why) + ' Until it can, budgets count Sellbird\'s own calls.</p>';
   }
   const labels = {five_hour: '5-hour window', seven_day: 'Weekly', primary: 'Primary window',
@@ -1606,7 +1617,7 @@ async function loadUsage() {
   const anyRows = (data.by_agent || []).length || (data.by_task || []).length;
   if (!anyRows) {
     tablesEl.innerHTML = emptyState(icon('usage'), 'No usage recorded yet',
-      'Once Sellbird starts making model calls (Claude or Codex), every one is logged here with exact calls and tokens by provider, agent and task.');
+      'Once Sellbird starts making model calls (Claude, Codex or OpenCode Go), every one is logged here with exact calls and tokens by provider, agent and task.');
   } else {
     const providers = data.by_provider || [];
     const showProviders = providers.length > 1 || (providers.length === 1 && providers[0].provider !== 'claude');
